@@ -1,6 +1,8 @@
 package main
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/craftamap/craftp/utils"
 	"github.com/pkg/sftp"
@@ -22,7 +24,7 @@ func main() {
 
 	app := cli.NewApp()
 	app.Name = "craftp"
-	app.Version = "v0.1.0dev190530"
+	app.Version = "v0.1.0dev190605"
 	app.Authors = []cli.Author{
 		cli.Author{
 			Name:  "Fabian Siegel",
@@ -34,9 +36,17 @@ func main() {
 	app.Flags = []cli.Flag{
 		cli.StringFlag{
 			Name:   "config, c",
-			Value:  ".",
+			Value:  "./.craftp",
 			Usage:  "path for a specific config directory from `FILE`",
 			EnvVar: "CRAFTP_CONFIG",
+		},
+	}
+	app.Flags = []cli.Flag{
+		cli.StringFlag{
+			Name:   "base, b",
+			Value:  "",
+			Usage:  "path for a specific base directory from `FILE`",
+			EnvVar: "CRAFTP_BASE",
 		},
 	}
 	app.Commands = []cli.Command{
@@ -45,17 +55,31 @@ func main() {
 			Aliases: []string{"t"},
 			Usage:   "prints a tree of the remote server",
 			Action: func(c *cli.Context) error {
-				configLocation := c.GlobalString("config")
-				configuration := Configuration{}
-				err := gonfig.GetConf(sftp.Join(configLocation, "config"), &configuration)
-				if err != nil {
-					fmt.Println(err)
+				return errors.New("")
+			},
+		},
+		{
+			Name: "init",
+			Action: func(c *cli.Context) error {
+				var err error
+				client := CraftpClient{}
+				first := c.Args().Get(0)
+				if first == "" {
+					first = "."
 				}
-				conn := craftpConnection{}
-				conn.Connect(configuration)
-				defer conn.Close()
-				conn.Tree([]string{configuration.BaseDir}, 0)
-				return nil
+				err = client.Init(first)
+				return err
+			},
+		},
+		{
+			Name: "remote",
+			Action: func(c *cli.Context) error {
+				client, err := CraftpClientNew(c.GlobalString("base"), c.GlobalString("config"))
+
+				client.Remote()
+
+				return err
+
 			},
 		},
 	}
@@ -80,7 +104,7 @@ func passwd() string {
 	return strings.TrimSpace(password)
 }
 
-type Configuration struct {
+type CraftpConfiguration struct {
 	User       string
 	Host       string
 	Port       int
@@ -88,12 +112,87 @@ type Configuration struct {
 	BaseDir    string
 }
 
-type craftpConnection struct {
+type CraftpClient struct {
+	connection    CraftpConnection
+	configuration CraftpConfiguration
+	local         CraftpLocal
+}
+
+func CraftpClientNew(baseDir string, configDir string) (CraftpClient, error) {
+	local := CraftpLocal{
+		baseDir:   baseDir,
+		configDir: configDir,
+	}
+	wd, _ := os.Getwd()
+	local.FindBase(wd + "/" + local.baseDir)
+	local.configDir = baseDir + ".craftp"
+	config, err := local.GetConfiguration()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	client := CraftpClient{
+		local:         local,
+		configuration: config,
+	}
+
+	return client, err
+}
+
+func (client *CraftpClient) Remote() error {
+	fmt.Println("Your current remote server is:")
+	fmt.Println("sftp://" + client.configuration.User + "@" + client.configuration.Host + ":" + strconv.Itoa(client.configuration.Port) + "/" + client.configuration.BaseDir)
+
+	return nil
+}
+
+func (c *CraftpClient) Init(path string) error {
+	file, err := os.Open(path)
+	if err != nil {
+		log.Fatal(err)
+		return err
+	}
+	defer file.Close()
+	wd, err := os.Getwd()
+	filestat, err := file.Stat()
+	if filestat.IsDir() && !c.local.HasBase(wd+"/"+path) {
+		err = os.Mkdir(sftp.Join(wd, path, ".craftp"), os.ModeDir+0750)
+		if err != nil {
+			log.Fatal(err)
+			return err
+		}
+		configFile, err := os.OpenFile(sftp.Join(path, ".craftp", "config"), os.O_CREATE|os.O_WRONLY, 0750)
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer configFile.Close()
+		emptyConf := CraftpConfiguration{}
+		jsonConf, err := json.Marshal(emptyConf)
+		if err != nil {
+			log.Fatal(err)
+			return err
+		}
+		_, err = configFile.Write(jsonConf)
+		if err != nil {
+			log.Fatal(err)
+			return err
+		}
+
+	} else if c.local.HasBase(wd + "/" + path) {
+		return errors.New("nesting not allowed or project already initialized")
+	} else {
+		return errors.New("path is a file or an unknown error occoured")
+	}
+	return err
+
+}
+
+type CraftpConnection struct {
 	sshClient  *ssh.Client
 	sftpClient *sftp.Client
 }
 
-func (s *craftpConnection) Connect(configuration Configuration) {
+func (s *CraftpConnection) Connect(configuration CraftpConfiguration) {
 	usr, err := user.Current()
 	if err != nil {
 		log.Fatal(err)
@@ -140,12 +239,12 @@ func (s *craftpConnection) Connect(configuration Configuration) {
 
 }
 
-func (s *craftpConnection) Close() {
+func (s *CraftpConnection) Close() {
 	s.sftpClient.Close()
 	s.sshClient.Close()
 }
 
-func (s *craftpConnection) Tree(basedir []string, count int) {
+func (s *CraftpConnection) Tree(basedir []string, count int) {
 	path := s.sftpClient.Join(basedir...)
 	filelist, err := s.sftpClient.ReadDir(path)
 	if err != nil {
@@ -160,4 +259,57 @@ func (s *craftpConnection) Tree(basedir []string, count int) {
 			s.Tree(b, count+1)
 		}
 	}
+}
+
+type CraftpLocal struct {
+	baseDir   string
+	configDir string
+}
+
+func (c *CraftpLocal) FindBase(path string) (string, error) {
+	base := ""
+	for k, _ := range strings.Split(path, "/") {
+		p := "/" + sftp.Join(strings.Split(path, "/")[:k+1][1:]...)
+
+		file, err := os.Open(p)
+		if err != nil {
+			log.Fatal(err)
+		}
+		list, err := file.Readdir(0)
+		if err != nil {
+			log.Fatal(err)
+		}
+		for _, v := range list {
+			if v.IsDir() && v.Name() == ".craftp" {
+				base = p
+			}
+
+		}
+	}
+
+	if base != "" {
+		c.baseDir = base
+		return base, nil
+	} else {
+		return "", errors.New("no basedirectory")
+	}
+
+}
+
+func (c *CraftpLocal) HasBase(path string) bool {
+	_, err := c.FindBase(path)
+	if err != nil {
+		return false
+	}
+	return true
+}
+
+func (c *CraftpLocal) GetConfiguration() (CraftpConfiguration, error) {
+	configuration := CraftpConfiguration{}
+	err := gonfig.GetConf(sftp.Join(c.configDir, "config"), &configuration)
+	if err != nil {
+		fmt.Println(err)
+		return configuration, err
+	}
+	return configuration, nil
 }
